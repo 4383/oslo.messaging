@@ -33,6 +33,7 @@ import kombu.messaging
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import eventletutils
+from oslo_utils import importutils
 import six
 import six.moves
 from six.moves.urllib import parse
@@ -45,6 +46,23 @@ from oslo_messaging._drivers import common as rpc_common
 from oslo_messaging._drivers import pool
 from oslo_messaging import _utils
 from oslo_messaging import exceptions
+
+# NOTE(hberaud): threading module is in use to run the rabbitmq health check
+# heartbeat, we want to force to use pthread here instead of using a
+# monkey patched thread for the heartbeat to avoid issue related to the
+# parent execution environment (example: mod_wsgi, uwsgi).
+# eventlet green threads doesn't work properly in a mod_wsgi environment so if
+# oslo.messaging users have monkey patch the stdlib for some reasons and if
+# they run theirs services under mod_wsgi the heartbeat thread will fail.
+# The heartbeat doesn't need a green thread to be ran.
+eventlet = importutils.try_import('eventlet')
+#eventlet_patched = eventlet and eventletutils.is_monkey_patched("thread")
+#if eventlet_patched:
+#        # We need to make # sure the *native* threading module for initialize
+#        # the heartbeat thread..
+#        threading = eventlet.patcher.original('threading')
+#else:
+#    import threading
 
 # NOTE(sileht): don't exists in py2 socket module
 TCP_USER_TIMEOUT = 18
@@ -549,8 +567,10 @@ class Connection(object):
         # NOTE(sileht): if purpose is PURPOSE_LISTEN
         # the consume code does the heartbeat stuff
         # we don't need a thread
+        print("CONNECTION PURPOSE: {}".format(purpose))
         self._heartbeat_thread = None
         if purpose == rpc_common.PURPOSE_SEND:
+            print("INIT HEARBEAT")
             self._heartbeat_start()
 
         LOG.debug('[%(connection_id)s] Connected to AMQP server on '
@@ -895,13 +915,27 @@ class Connection(object):
         self.connection.heartbeat_check(rate=self.heartbeat_rate)
 
     def _heartbeat_start(self):
+        print('START A NEW HEARTBEAT')
         if self._heartbeat_supported_and_enabled():
+            LOG.debug('Starting the heartbeat')
+            eventlet_patched = eventlet and eventletutils.is_monkey_patched(
+                "thread")
+            if eventlet_patched:
+                print('RUNNING THE HEARTBEAT OVER AN EVENTLET PATCHED ENV')
+                LOG.debug('Running the heartbeat over an eventlet patched env')
+                job = self._heartbeat_thread_job_wrapper
+            else:
+                print('RUNNING THE HEARTBEAT OVER A NON PATCHED ENV')
+                LOG.debug('Running the heartbeat over a non patched env')
+                job = self._heartbeat_thread_job
+            return
             self._heartbeat_exit_event = eventletutils.Event()
             self._heartbeat_thread = threading.Thread(
-                target=self._heartbeat_thread_job, name="Rabbit-heartbeat")
+                target=job, name="Rabbit-heartbeat")
             self._heartbeat_thread.daemon = True
             self._heartbeat_thread.start()
         else:
+            LOG.debug('Ignoring the heartbeat')
             self._heartbeat_thread = None
 
     def _heartbeat_stop(self):
@@ -911,19 +945,16 @@ class Connection(object):
             self._heartbeat_thread = None
 
     def _heartbeat_thread_job(self):
-        """Thread that maintains inactive connections
-        """
         # NOTE(hberaud): Python2 doesn't have ConnectionRefusedError
         # defined so to switch connections destination on failure
         # with python2 and python3 we need to wrapp adapt connection refused
+        print("STARTING HEARTBEAT THREAD JOB")
         try:
             ConnectRefuseError = ConnectionRefusedError
         except NameError:
             ConnectRefuseError = socket.error
-
         while not self._heartbeat_exit_event.is_set():
             with self._connection_lock.for_heartbeat():
-
                 try:
                     try:
                         self._heartbeat_check()
@@ -960,6 +991,16 @@ class Connection(object):
             self._heartbeat_exit_event.wait(
                 timeout=self._heartbeat_wait_timeout)
         self._heartbeat_exit_event.clear()
+
+    def _heartbeat_thread_job_wrapper(self):
+        """Thread that maintains inactive connections
+        """
+        while not self._heartbeat_exit_event.is_set():
+            eventlet.tpool.execute(self._heartbeat_thread_job)
+            self._heartbeat_exit_event.wait(
+                timeout=self._heartbeat_wait_timeout)
+        self._heartbeat_exit_event.clear()
+
 
     def declare_consumer(self, consumer):
         """Create a Consumer using the class that was passed in and
